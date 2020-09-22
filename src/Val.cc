@@ -572,13 +572,15 @@ static void BuildJSON(threading::formatter::JSON::NullDoubleWriter& writer, Val*
 			else
 				writer.StartObject();
 
-			detail::HashKey* k;
+			std::unique_ptr<detail::HashKey> k;
 			TableEntryVal* entry;
-			auto c = table->InitForIteration();
-			while ( (entry = table->NextEntry(k, c)) )
+
+			for ( const auto& te : *table )
 				{
+				entry = te.GetValue<TableEntryVal*>();
+				k = te.GetHashKey();
+
 				auto lv = tval->RecreateIndex(*k);
-				delete k;
 				Val* entry_key = lv->Length() == 1 ? lv->Idx(0).get() : lv.get();
 
 				if ( tval->GetType()->IsSet() )
@@ -1432,7 +1434,7 @@ void TableVal::Init(TableTypePtr t)
 	table_type = std::move(t);
 	expire_func = nullptr;
 	expire_time = nullptr;
-	expire_cookie = nullptr;
+	expire_iterator = nullptr;
 	timer = nullptr;
 	def_val = nullptr;
 
@@ -1454,6 +1456,7 @@ TableVal::~TableVal()
 	delete table_hash;
 	delete AsTable();
 	delete subnets;
+	delete expire_iterator;
 	}
 
 void TableVal::RemoveAll()
@@ -1478,11 +1481,9 @@ int TableVal::RecursiveSize() const
 		return n;
 
 	PDict<TableEntryVal>* v = val.table_val;
-	IterCookie* c = v->InitForIteration();
-
-	TableEntryVal* tv;
-	while ( (tv = v->NextEntry(c)) )
+	for ( const auto& ve : *v )
 		{
+		auto* tv = ve.GetValue<TableEntryVal*>();
 		if ( tv->GetVal() )
 			n += tv->GetVal()->AsTableVal()->RecursiveSize();
 		}
@@ -1653,15 +1654,12 @@ bool TableVal::AddTo(Val* val, bool is_first_init, bool propagate_ops) const
 		}
 
 	const PDict<TableEntryVal>* tbl = AsTable();
-	IterCookie* c = tbl->InitForIteration();
-
-	detail::HashKey* k;
-	TableEntryVal* v;
-	while ( (v = tbl->NextEntry(k, c)) )
+	for ( const auto& tble : *tbl )
 		{
-		std::unique_ptr<detail::HashKey> hk{k};
+		auto k = tble.GetHashKey();
+		auto* v = tble.GetValue<TableEntryVal*>();
 
-		if ( is_first_init && t->AsTable()->Lookup(k) )
+		if ( is_first_init && t->AsTable()->Lookup(k.get()) )
 			{
 			auto key = table_hash->RecoverVals(*k);
 			// ### Shouldn't complain if their values are equal.
@@ -1671,12 +1669,12 @@ bool TableVal::AddTo(Val* val, bool is_first_init, bool propagate_ops) const
 
 		if ( type->IsSet() )
 			{
-			if ( ! t->Assign(v->GetVal(), std::move(hk), nullptr) )
+			if ( ! t->Assign(v->GetVal(), std::move(k), nullptr) )
 				 return false;
 			}
 		else
 			{
-			if ( ! t->Assign(nullptr, std::move(hk), v->GetVal()) )
+			if ( ! t->Assign(nullptr, std::move(k), v->GetVal()) )
 				 return false;
 			}
 		}
@@ -1701,18 +1699,15 @@ bool TableVal::RemoveFrom(Val* val) const
 		}
 
 	const PDict<TableEntryVal>* tbl = AsTable();
-	IterCookie* c = tbl->InitForIteration();
-
-	detail::HashKey* k;
-	while ( tbl->NextEntry(k, c) )
+	for ( const auto& tble : *tbl )
 		{
 		// Not sure that this is 100% sound, since the HashKey
 		// comes from one table but is being used in another.
 		// OTOH, they are both the same type, so as long as
 		// we don't have hash keys that are keyed per dictionary,
 		// it should work ...
+		auto k = tble.GetHashKey();
 		t->Remove(*k);
-		delete k;
 		}
 
 	return true;
@@ -1734,16 +1729,15 @@ TableValPtr TableVal::Intersection(const TableVal& tv) const
 		t0 = tmp;
 		}
 
-	IterCookie* c = t1->InitForIteration();
-	detail::HashKey* k;
-	while ( t1->NextEntry(k, c) )
+	const PDict<TableEntryVal>* tbl = AsTable();
+	for ( const auto& tble : *tbl )
 		{
+		auto k = tble.GetHashKey();
+
 		// Here we leverage the same assumption about consistent
 		// hashes as in TableVal::RemoveFrom above.
-		if ( t0->Lookup(k) )
-			t2->Insert(k, new TableEntryVal(nullptr));
-
-		delete k;
+		if ( t0->Lookup(k.get()) )
+			t2->Insert(k.get(), new TableEntryVal(nullptr));
 		}
 
 	return result;
@@ -1757,20 +1751,14 @@ bool TableVal::EqualTo(const TableVal& tv) const
 	if ( t0->Length() != t1->Length() )
 		return false;
 
-	IterCookie* c = t0->InitForIteration();
-	detail::HashKey* k;
-	while ( t0->NextEntry(k, c) )
+	for ( const auto& tble : *t0 )
 		{
+		auto k = tble.GetHashKey();
+
 		// Here we leverage the same assumption about consistent
 		// hashes as in TableVal::RemoveFrom above.
-		if ( ! t1->Lookup(k) )
-			{
-			delete k;
-			t0->StopIteration(c);
+		if ( ! t1->Lookup(k.get()) )
 			return false;
-			}
-
-		delete k;
 		}
 
 	return true;
@@ -1784,20 +1772,14 @@ bool TableVal::IsSubsetOf(const TableVal& tv) const
 	if ( t0->Length() > t1->Length() )
 		return false;
 
-	IterCookie* c = t0->InitForIteration();
-	detail::HashKey* k;
-	while ( t0->NextEntry(k, c) )
+	for ( const auto& tble : *t0 )
 		{
+		auto k = tble.GetHashKey();
+
 		// Here we leverage the same assumption about consistent
 		// hashes as in TableVal::RemoveFrom above.
-		if ( ! t1->Lookup(k) )
-			{
-			delete k;
-			t0->StopIteration(c);
+		if ( ! t1->Lookup(k.get()) )
 			return false;
-			}
-
-		delete k;
 		}
 
 	return true;
@@ -2332,11 +2314,9 @@ ListValPtr TableVal::ToListVal(TypeTag t) const
 	auto l = make_intrusive<ListVal>(t);
 
 	const PDict<TableEntryVal>* tbl = AsTable();
-	IterCookie* c = tbl->InitForIteration();
-
-	detail::HashKey* k;
-	while ( tbl->NextEntry(k, c) )
+	for ( const auto& tble : *tbl )
 		{
+		auto k = tble.GetHashKey();
 		auto index = table_hash->RecoverVals(*k);
 
 		if ( t == TYPE_ANY )
@@ -2349,8 +2329,6 @@ ListValPtr TableVal::ToListVal(TypeTag t) const
 
 			l->Append(index->Idx(0));
 			}
-
-		delete k;
 		}
 
 	return l;
@@ -2402,15 +2380,15 @@ void TableVal::Describe(ODesc* d) const
 		d->PushIndent();
 		}
 
-	IterCookie* c = tbl->InitForIteration();
+	auto iter = tbl->begin();
 
 	for ( int i = 0; i < n; ++i )
 		{
-		detail::HashKey* k;
-		TableEntryVal* v = tbl->NextEntry(k, c);
-
-		if ( ! v )
+		if ( iter == tbl->end() )
 			reporter->InternalError("hash table underflow in TableVal::Describe");
+
+		auto k = iter->GetHashKey();
+		auto* v = iter->GetValue<TableEntryVal*>();
 
 		auto vl = table_hash->RecoverVals(*k);
 		int dim = vl->Length();
@@ -2436,8 +2414,6 @@ void TableVal::Describe(ODesc* d) const
 
 		vl->Describe(d);
 
-		delete k;
-
 		if ( table_type->IsSet() )
 			{ // We're a set, not a table.
 			if ( d->IsReadable() )
@@ -2457,9 +2433,11 @@ void TableVal::Describe(ODesc* d) const
 			d->Add(" @");
 			d->Add(util::detail::fmt_access_time(v->ExpireAccessTime()));
 			}
+
+		++iter;
 		}
 
-	if ( tbl->NextEntry(c) )
+	if ( iter != tbl->end() )
 		reporter->InternalError("hash table overflow in TableVal::Describe");
 
 	if ( d->IsPortable() || d->IsReadable() )
@@ -2556,20 +2534,23 @@ void TableVal::DoExpire(double t)
 		// error, it has been reported already.
 		return;
 
-	if ( ! expire_cookie )
+	if ( ! expire_iterator )
 		{
-		expire_cookie = tbl->InitForIteration();
-		tbl->MakeRobustCookie(expire_cookie);
+		auto it = tbl->begin_robust();
+		expire_iterator = new RobustDictIterator(std::move(it));
 		}
 
-	detail::HashKey* k = nullptr;
+	std::unique_ptr<detail::HashKey> k = nullptr;
 	TableEntryVal* v = nullptr;
 	TableEntryVal* v_saved = nullptr;
 	bool modified = false;
 
 	for ( int i = 0; i < zeek::detail::table_incremental_step &&
-		      (v = tbl->NextEntry(k, expire_cookie)); ++i )
+		      *expire_iterator != tbl->end_robust(); ++i, ++(*expire_iterator) )
 		{
+		k = (*expire_iterator)->GetHashKey();
+		v = (*expire_iterator)->GetValue<TableEntryVal*>();
+
 		if ( v->ExpireAccessTime() == 0 )
 			{
 			// This happens when we insert val while network_time
@@ -2592,12 +2573,11 @@ void TableVal::DoExpire(double t)
 				// function modified or deleted the table
 				// value, so look it up again.
 				v_saved = v;
-				v = tbl->Lookup(k);
+				v = tbl->Lookup(k.get());
 
 				if ( ! v )
 					{ // user-provided function deleted it
 					v = v_saved;
-					delete k;
 					continue;
 					}
 
@@ -2606,7 +2586,6 @@ void TableVal::DoExpire(double t)
 					// User doesn't want us to expire
 					// this now.
 					v->SetExpireAccess(run_state::network_time - timeout + secs);
-					delete k;
 					continue;
 					}
 
@@ -2620,7 +2599,7 @@ void TableVal::DoExpire(double t)
 					reporter->InternalWarning("index not in prefix table");
 				}
 
-			tbl->RemoveEntry(k);
+			tbl->RemoveEntry(k.get());
 			if ( change_func )
 				{
 				if ( ! idx )
@@ -2632,16 +2611,15 @@ void TableVal::DoExpire(double t)
 			delete v;
 			modified = true;
 			}
-
-		delete k;
 		}
 
 	if ( modified )
 		Modified();
 
-	if ( ! v )
+	if ( (*expire_iterator) == tbl->end_robust() )
 		{
-		expire_cookie = nullptr;
+		delete expire_iterator;
+		expire_iterator = nullptr;
 		InitTimer(zeek::detail::table_expire_interval);
 		}
 	else
@@ -2745,22 +2723,18 @@ ValPtr TableVal::DoClone(CloneState* state)
 	state->NewClone(this, tv);
 
 	const PDict<TableEntryVal>* tbl = AsTable();
-	IterCookie* cookie = tbl->InitForIteration();
-
-	detail::HashKey* key;
-	TableEntryVal* val;
-	while ( (val = tbl->NextEntry(key, cookie)) )
+	for ( const auto& tble : *tbl )
 		{
+		auto key = tble.GetHashKey();
+		auto* val = tble.GetValue<TableEntryVal*>();
 		TableEntryVal* nval = val->Clone(state);
-		tv->AsNonConstTable()->Insert(key, nval);
+		tv->AsNonConstTable()->Insert(key.get(), nval);
 
 		if ( subnets )
 			{
 			auto idx = RecreateIndex(*key);
 			tv->subnets->Insert(idx.get(), nval);
 			}
-
-		delete key;
 		}
 
 	tv->attrs = attrs;
@@ -2789,11 +2763,9 @@ unsigned int TableVal::MemoryAllocation() const
 	unsigned int size = 0;
 
 	PDict<TableEntryVal>* v = val.table_val;
-	IterCookie* c = v->InitForIteration();
-
-	TableEntryVal* tv;
-	while ( (tv = v->NextEntry(c)) )
+	for ( const auto& ve : *v )
 		{
+		auto* tv = ve.GetValue<TableEntryVal*>();
 		if ( tv->GetVal() )
 			size += tv->GetVal()->MemoryAllocation();
 		size += padded_sizeof(TableEntryVal);
@@ -2839,18 +2811,14 @@ void TableVal::DoneParsing()
 
 TableVal::ParseTimeTableState TableVal::DumpTableState()
 	{
-	const PDict<TableEntryVal>* tbl = AsTable();
-	IterCookie* cookie = tbl->InitForIteration();
-
-	detail::HashKey* key;
-	TableEntryVal* val;
-
 	ParseTimeTableState rval;
-
-	while ( (val = tbl->NextEntry(key, cookie)) )
+	const PDict<TableEntryVal>* tbl = AsTable();
+	for ( const auto& tble : *tbl )
 		{
+		auto key = tble.GetHashKey();
+		auto* val = tble.GetValue<TableEntryVal*>();
+
 		rval.emplace_back(RecreateIndex(*key), val->GetVal());
-		delete key;
 		}
 
 	RemoveAll();
